@@ -1,0 +1,136 @@
+### Instance Data ###
+
+I (production plants):
+[0, 1, 2]
+
+C (potential distribution centers):
+[0, 1, 2, 3, 4, 5]
+
+R (regional distribution centers):
+[0, 1, 2, 3, 4, 5, 6, 7, 8]
+
+a_ij (transportation cost from plants I to centers C):
+0 0 72
+0 1 87
+0 2 53
+0 3 27
+0 4 38
+0 5 56
+1 0 35
+1 1 49
+1 2 29
+1 3 26
+1 4 4
+1 5 22
+2 0 65
+2 1 17
+2 2 85
+2 3 69
+2 4 51
+2 5 33
+
+b_jr (transportation cost from centers C to regional centers R):
+0 0 33
+0 1 60
+0 2 85
+0 3 109
+0 4 10
+0 5 73
+0 6 66
+0 7 60
+0 8 48
+1 0 82
+1 1 12
+1 2 134
+1 3 158
+1 4 38
+1 5 62
+1 6 115
+1 7 109
+1 8 97
+2 0 13
+2 1 80
+2 2 65
+2 3 89
+2 4 30
+2 5 93
+2 6 47
+2 7 40
+2 8 66
+3 0 51
+3 1 75
+3 2 89
+3 3 113
+3 4 59
+3 5 135
+3 6 89
+3 7 64
+3 8 108
+4 0 48
+4 1 47
+4 2 99
+4 3 123
+4 4 31
+4 5 108
+4 6 80
+4 7 75
+4 8 81
+5 0 66
+5 1 33
+5 2 117
+5 3 141
+5 4 21
+5 5 93
+5 6 98
+5 7 92
+5 8 80
+
+p_i (production capacity of plants I):
+90 80 92
+
+q_j (supply capacity of distribution centers C):
+0 493
+1 430
+2 362
+3 322
+4 450
+5 375
+
+c_j (activation cost of distribution centers C):
+0 1246
+1 1215
+2 1181
+3 1161
+4 1225
+5 1187
+
+d_r (demand of regional centers R):
+0 36
+1 38
+2 31
+3 28
+4 37
+5 7
+6 16
+7 10
+8 36
+
+N_c (set of plants that can serve each distribution center j):
+0: [0, 1, 2]
+1: [0, 1, 2]
+2: [0, 1, 2]
+3: [0, 1, 2]
+4: [0, 1, 2]
+5: [0, 1, 2]
+
+T_r (set of distribution centers that can serve each regional center r):
+0: [0, 1, 2, 3, 4, 5]
+1: [0, 1, 2, 3, 4, 5]
+2: [0, 2, 3, 4, 5]
+3: [0, 2, 3, 4]
+4: [0, 1, 2, 3, 4, 5]
+5: [0, 1, 2, 4, 5]
+6: [0, 1, 2, 3, 4, 5]
+7: [0, 1, 2, 3, 4, 5]
+8: [0, 1, 2, 3, 4, 5]
+

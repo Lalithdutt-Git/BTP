@@ -1,0 +1,43 @@
+============================================================
+SOLUTION SUMMARY
+============================================================
+Status: Optimal
+Objective Value: 1871.00
+Solution Time: 0.09 seconds
+Optimality Gap: 0.0000%
+
+Number of Activated HUBSs: 1
+Activated HUBS IDs: [2]
+
+------------------------------------------------------------
+FACTORIES TO HUB ASSIGNMENTS:
+------------------------------------------------------------
+  FACTORY 0 -> HUB 2
+  FACTORY 1 -> HUB 2
+  FACTORY 2 -> HUB 2
+
+------------------------------------------------------------
+HUB TO ZONE ASSIGNMENTS:
+------------------------------------------------------------
+  HUB 2 -> ZONES 0
+  HUB 2 -> ZONES 1
+  HUB 2 -> ZONES 2
+  HUB 2 -> ZONES 3
+  HUB 2 -> ZONES 4
+  HUB 2 -> ZONES 5
+  HUB 2 -> ZONES 6
+  HUB 2 -> ZONES 7
+  HUB 2 -> ZONES 8
+============================================================
+
+Instance Summary:
+Production Plants (I): 3 plants
+Distribution Centers (C): 6 centers
+Regional Centers (R): 9 centers
+
+Transportation costs (a_ij): 18 entries
+Transportation costs (b_jr): 54 entries
+
+Total production capacity: 262.00
+Total demand: 239.00
+Total activation cost: 7215.00

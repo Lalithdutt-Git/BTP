@@ -1,0 +1,16 @@
+QUBO Solution Summary
+Feasible: True
+Original objective: 1609.00
+QUBO energy: 1609.00, offset: 71760.00
+Activated CDCs:
+ z[1]
+Plant->CDC (x=1):
+ x[0,1]
+ x[1,1]
+CDC->RDC (y=1):
+ y[1,0]
+ y[1,1]
+ y[1,2]
+ y[1,3]
+ y[1,4]
+ y[1,5]

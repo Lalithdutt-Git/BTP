@@ -1,0 +1,5 @@
+Two-Stage Logistics Network Design (Adaptive Penalty QUBO)
+Feasible: True
+Original Objective: 1609.00
+QUBO Energy: 1609.00, Offset: 215280.00
+
