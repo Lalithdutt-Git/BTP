@@ -18,7 +18,9 @@ Options:
     --reads     INT   SA reads per iteration         (default 8000)
     --iters     INT   APL outer iterations           (default 40)
     --sweeps    INT   SA sweeps per read             (default 5000)
+    --use_ppln        Apply PPLN preprocessing       (default True)
     --no_ppln         Skip PPLN preprocessing
+    --pop_size  INT   SA population size             (default 5)
     --seed      INT   Random seed                    (default 42)
     --time_limit FLOAT  Wall-clock time limit (s)   (default 300)
 """
@@ -373,77 +375,31 @@ def build_qubo_with_slacks(data: InstanceData,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Greedy seed builder — shared by both the NumPy and Neal samplers
-# ──────────────────────────────────────────────────────────────────────────────
-
-def build_greedy_seed(data: InstanceData, xmap, ymap, zmap, Q: dict) -> dict:
-    """
-    Construct a smart starting point for SA covering EVERY variable in the QUBO
-    (decision variables + slack variables).  Neal requires the initial_states
-    SampleSet to contain exactly the same variable set as the BQM — no more,
-    no less.
-
-    Decision variables are set greedily:
-      1. Assign each RDC to the cheapest CDC that can serve it (lowest b_jr).
-      2. Activate every CDC that received at least one RDC assignment (z_j = 1).
-      3. For each active CDC assign the cheapest plant that can serve it (lowest a_ij).
-
-    Slack variables (s1_*, s2_*) are initialised to 0.  Neal's SA will move
-    them to their correct values during annealing.
-    """
-    # Collect every variable that appears in the QUBO
-    all_qubo_vars = set()
-    for (u, v) in Q:
-        all_qubo_vars.add(u)
-        all_qubo_vars.add(v)
-
-    # Start with every variable set to 0 (covers slacks automatically)
-    sample = {var: 0 for var in all_qubo_vars}
-
-    # Step 1: assign each RDC to lowest-cost CDC
-    for r in data.R:
-        best_j = min(data.T_r[r], key=lambda j: data.b_jr.get((j, r), 1e9))
-        sample[ymap[(best_j, r)]] = 1
-
-    # Step 2: activate CDCs that received an RDC assignment
-    active_cdcs = set()
-    for (j, r), nm in ymap.items():
-        if sample[nm] == 1:
-            active_cdcs.add(j)
-    for j in active_cdcs:
-        sample[zmap[j]] = 1
-
-    # Step 3: assign cheapest plant to each active CDC
-    for j in active_cdcs:
-        if not data.N_c[j]:
-            continue
-        best_i = min(data.N_c[j], key=lambda i: data.a_ij.get((i, j), 1e9))
-        sample[xmap[(best_i, j)]] = 1
-
-    return sample
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Pure NumPy SA sampler — only used when neal/dimod are not installed
+# Pure NumPy Simulated Annealing sampler (fallback when neal unavailable)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class NumpySASampler:
     """
-    Minimal vectorised SA fallback for environments without neal.
-    The first read starts from the provided greedy initial_state;
-    all remaining reads start from random binary vectors.
+    Fast vectorised SA for QUBO problems.
+    Supports multiple independent reads (parallel chains).
     """
 
     def sample_qubo(self,
                     Q: dict,
                     num_reads: int = 1000,
                     num_sweeps: int = 3000,
-                    beta_range: Tuple[float, float] = (0.1, 10.0),
-                    initial_state: dict = None,
+                    beta_range: Tuple[float,float] = (0.1, 10.0),
                     seed: int = None
-                    ) -> List[Tuple[dict, float]]:
-        rng = np.random.default_rng(seed)
+                    ) -> List[dict]:
+        """
+        Returns list of (sample_dict, energy) tuples, best-first.
+        """
+        if seed is not None:
+            rng = np.random.default_rng(seed)
+        else:
+            rng = np.random.default_rng()
 
+        # Build variable index
         vars_set = set()
         for (u, v) in Q:
             vars_set.add(u)
@@ -455,9 +411,129 @@ class NumpySASampler:
         if n == 0:
             return [({}, 0.0)]
 
+        # Build dense Q matrix
         Qmat = np.zeros((n, n), dtype=np.float64)
         for (u, v), val in Q.items():
-            Qmat[var_idx[u], var_idx[v]] += val
+            i, j = var_idx[u], var_idx[v]
+            if i == j:
+                Qmat[i, i] += val
+            else:
+                # Store in upper triangle; eval uses x^T Q x
+                Qmat[i, j] += val
+
+        # Precompute h (linear) and J (upper-triangle interactions)
+        h = np.diag(Qmat).copy()
+        J = Qmat.copy()
+        np.fill_diagonal(J, 0.0)
+
+        def energy_of(x):
+            return x @ h + x @ (J @ x)
+
+        # Temperature schedule (geometric)
+        T_hi, T_lo = 1.0/beta_range[0], 1.0/beta_range[1]
+        temps = np.geomspace(T_hi, T_lo, num_sweeps)
+
+        results = []
+        for _ in range(num_reads):
+            x = rng.integers(0, 2, size=n).astype(np.float64)
+            E = energy_of(x)
+
+            for T in temps:
+                # Random single-bit flip
+                k   = int(rng.integers(n))
+                dE  = (1 - 2*x[k]) * (h[k] + (J[k,:] + J[:,k]) @ x)
+                if dE < 0 or rng.random() < math.exp(-dE / T):
+                    x[k] = 1 - x[k]
+                    E   += dE
+
+            results.append(({var_list[i]: int(x[i]) for i in range(n)}, E))
+
+        results.sort(key=lambda t: t[1])
+        return results
+
+
+class PopulationSASampler:
+    """
+    Enhanced SA with:
+      - Greedy feasibility seeding
+      - Population of independent chains
+      - Occasional perturbation restarts from elite solutions
+    """
+
+    def __init__(self, pop_size: int = 5, seed: int = 42):
+        self.pop_size = pop_size
+        self.rng      = np.random.default_rng(seed)
+        self._base_sa = NumpySASampler()
+
+    def _greedy_seed(self, data: InstanceData,
+                     xmap, ymap, zmap) -> dict:
+        """
+        Construct a feasible seed:
+          1. Assign each RDC to cheapest available CDC (b_jr).
+          2. Activate CDCs used.
+          3. Assign cheapest plant to each active CDC (a_ij).
+        """
+        sample = {}
+        for nm in list(xmap.values()) + list(ymap.values()) + list(zmap.values()):
+            sample[nm] = 0
+
+        # Step 1: assign each RDC to lowest-cost CDC
+        for r in data.R:
+            best_j = min(data.T_r[r], key=lambda j: data.b_jr.get((j,r), 1e9))
+            sample[ymap[(best_j, r)]] = 1
+
+        # Step 2: activate CDCs that are assigned
+        active_cdcs = set()
+        for (j,r), nm in ymap.items():
+            if sample[nm] == 1:
+                active_cdcs.add(j)
+        for j in active_cdcs:
+            sample[zmap[j]] = 1
+
+        # Step 3: for each active CDC assign cheapest plant
+        for j in active_cdcs:
+            if not data.N_c[j]:
+                continue
+            best_i = min(data.N_c[j], key=lambda i: data.a_ij.get((i,j), 1e9))
+            sample[xmap[(best_i, j)]] = 1
+
+        return sample
+
+    def _seed_to_array(self, seed_dict, var_list, var_idx):
+        n = len(var_list)
+        x = np.zeros(n, dtype=np.float64)
+        for nm, v in seed_dict.items():
+            if nm in var_idx:
+                x[var_idx[nm]] = float(v)
+        return x
+
+    def sample_qubo(self,
+                    Q: dict,
+                    data: InstanceData,
+                    xmap, ymap, zmap,
+                    num_reads: int = 1000,
+                    num_sweeps: int = 3000,
+                    beta_range: Tuple[float,float] = (0.1, 15.0),
+                    ) -> List[Tuple[dict, float]]:
+        """
+        Returns list of (sample_dict, energy) best-first.
+        """
+        # Build index
+        vars_set = set()
+        for (u,v) in Q:
+            vars_set.add(u); vars_set.add(v)
+        var_list = sorted(vars_set)
+        var_idx  = {v: i for i,v in enumerate(var_list)}
+        n        = len(var_list)
+
+        if n == 0:
+            return [({}, 0.0)]
+
+        # Dense matrices
+        Qmat = np.zeros((n,n), dtype=np.float64)
+        for (u,v), val in Q.items():
+            i, j = var_idx[u], var_idx[v]
+            Qmat[i,j] += val
 
         h = np.diag(Qmat).copy()
         J = Qmat.copy()
@@ -466,26 +542,44 @@ class NumpySASampler:
         def energy_of(x):
             return float(x @ h + x @ (J @ x))
 
-        T_hi, T_lo = 1.0 / beta_range[0], 1.0 / beta_range[1]
+        T_hi, T_lo = 1.0/beta_range[0], 1.0/beta_range[1]
         temps = np.geomspace(T_hi, T_lo, num_sweeps)
 
+        # Prepare initial population
+        population = []
+
+        # 1 greedy seed
+        gs   = self._greedy_seed(data, xmap, ymap, zmap)
+        x_gs = self._seed_to_array(gs, var_list, var_idx)
+        population.append(x_gs)
+
+        # rest random
+        for _ in range(self.pop_size - 1):
+            population.append(self.rng.integers(0,2,size=n).astype(np.float64))
+
         results = []
-        for read_idx in range(num_reads):
-            if read_idx == 0 and initial_state is not None:
-                x = np.array([float(initial_state.get(var_list[i], 0))
-                               for i in range(n)], dtype=np.float64)
-            else:
-                x = rng.integers(0, 2, size=n).astype(np.float64)
+        reads_per_chain = max(1, num_reads // self.pop_size)
 
-            E = energy_of(x)
-            for T in temps:
-                k  = int(rng.integers(n))
-                dE = (1 - 2 * x[k]) * (h[k] + (J[k, :] + J[:, k]) @ x)
-                if dE < 0 or rng.random() < math.exp(-dE / T):
-                    x[k] = 1 - x[k]
-                    E   += dE
+        for chain_init in population:
+            for _ in range(reads_per_chain):
+                x = chain_init.copy()
+                E = energy_of(x)
 
-            results.append(({var_list[i]: int(x[i]) for i in range(n)}, E))
+                for T in temps:
+                    k  = int(self.rng.integers(n))
+                    dE = (1 - 2*x[k]) * (h[k] + (J[k,:] + J[:,k]) @ x)
+                    if dE < 0 or self.rng.random() < math.exp(min(0, -dE/T)):
+                        x[k] = 1 - x[k]
+                        E   += dE
+
+                sample = {var_list[i]: int(x[i]) for i in range(n)}
+                results.append((sample, E))
+
+                # Perturb for next read (restart from this solution w/ noise)
+                flip_n = max(1, int(0.05 * n))
+                idxs = self.rng.choice(n, flip_n, replace=False)
+                chain_init = x.copy()
+                chain_init[idxs] = 1 - chain_init[idxs]
 
         results.sort(key=lambda t: t[1])
         return results
@@ -519,8 +613,10 @@ def extract_solution(sample: dict, xmap, ymap, zmap):
 
 def solve(data: InstanceData,
           num_reads:  int   = 8000,
-          num_iters:  int   = 40,
+          # MODIFY THIS 
+          num_iters:  int   = 10,
           num_sweeps: int   = 5000,
+          pop_size:   int   = 5,
           seed:       int   = 42,
           time_limit: float = 300.0,
           verbose:    bool  = True
@@ -531,13 +627,15 @@ def solve(data: InstanceData,
 
     # ── Choose sampler ────────────────────────────────────────────────────────
     if HAS_NEAL:
-        sampler = neal.SimulatedAnnealingSampler()
+        neal_sampler = neal.SimulatedAnnealingSampler()
+        use_population = False
         if verbose:
-            print("[Sampler] Using D-Wave Neal SA  (greedy seed applied to first read)")
+            print("[Sampler] Using D-Wave Neal SA")
     else:
-        sampler = NumpySASampler()
+        pop_sampler    = PopulationSASampler(pop_size=pop_size, seed=seed)
+        use_population = True
         if verbose:
-            print("[Sampler] Using built-in NumPy SA  (greedy seed applied to first read)")
+            print("[Sampler] Using built-in Population SA (NumPy)")
 
     # ── Penalty initialisation ────────────────────────────────────────────────
     # Scale initial penalties to the objective magnitude
@@ -558,13 +656,12 @@ def solve(data: InstanceData,
     beta_decrease  = 0.05               # Penalty decay rate when satisfied
 
     best: Optional[QUBOSolution] = None
-    elite_pool: List[QUBOSolution] = []
-    best_obj_iter: Optional[int] = None  # iteration where solution (zero violations + best obj) was found
-    num_qubits: int = 0                  # total unique variables (qubits) in the QUBO
+    best_iter: Optional[int] = None          # iteration where best solution found
+    elite_pool: List[QUBOSolution] = [] # Keep top-k feasible solutions
 
     penalty_log = []
     start_time  = time.time()
-
+    num_qubits: Optional[int] = None         # populated on first neal call
 
     if verbose:
         print(f"\n[APL] Initial penalties: P1={P1:.1f}, P2={P2:.1f}, P3={P3:.1f}")
@@ -580,49 +677,31 @@ def solve(data: InstanceData,
 
         Q, xmap, ymap, zmap = build_qubo_with_slacks(data, P1, P2, P3)
 
-        # ── Count qubits once (QUBO structure is identical every iteration) ──
-        if num_qubits == 0:
-            all_vars = set()
-            for (u, v) in Q:
-                all_vars.add(u)
-                all_vars.add(v)
-            num_qubits = len(all_vars)
-            n_decision = len(xmap) + len(ymap) + len(zmap)
-            n_slack    = num_qubits - n_decision
-            if verbose:
-                print(f"[QUBO] Total variables (qubits): {num_qubits}  "
-                      f"(decision={n_decision}, slack={n_slack})\n")
-
-        # ── Build greedy seed covering ALL QUBO variables (decision + slack) ──
-        greedy_seed = build_greedy_seed(data, xmap, ymap, zmap, Q)
-
         # ── Sample ───────────────────────────────────────────────────────────
-        if HAS_NEAL:
-            # greedy_seed now contains every variable in Q, so no mismatch.
-            initial_ss = dimod.SampleSet.from_samples(
-                greedy_seed,
-                vartype=dimod.BINARY,
-                energy=0.0
+        if use_population:
+            samples = pop_sampler.sample_qubo(
+                Q, data, xmap, ymap, zmap,
+                num_reads  = num_reads,
+                num_sweeps = num_sweeps,
             )
-            sampleset = sampler.sample_qubo(
-                Q,
-                num_reads      = num_reads,
-                num_sweeps     = num_sweeps,
-                initial_states = initial_ss,
-            )
-            sample_list = [(s.sample, s.energy) for s in sampleset.data()]
+            sample_list = samples  # list of (dict, energy)
         else:
-            sample_list = sampler.sample_qubo(
-                Q,
-                num_reads     = num_reads,
-                num_sweeps    = num_sweeps,
-                initial_state = greedy_seed,
-                seed          = seed + t,
-            )
+            sampleset   = neal_sampler.sample_qubo(
+                Q, num_reads=num_reads, num_sweeps=num_sweeps)
+            sample_list = [(s.sample, s.energy) for s in sampleset.data()]
+            # Capture qubit count once (number of unique variables in Q)
+            if num_qubits is None:
+                vars_in_Q = set()
+                for (u, v) in Q:
+                    vars_in_Q.add(u)
+                    vars_in_Q.add(v)
+                num_qubits = len(vars_in_Q)
 
         # ── Evaluate all samples ──────────────────────────────────────────────
-        iter_best_v = (math.inf, math.inf, math.inf)
-        iter_best_e = math.inf
+        iter_best_v   = (math.inf, math.inf, math.inf)
+        iter_best_sol = None
+        iter_best_e   = math.inf
+        last_v1 = last_v2 = last_v3 = 0.0
 
         for sample_dict, energy in sample_list:
             x, y, z = extract_solution(sample_dict, xmap, ymap, zmap)
@@ -635,7 +714,7 @@ def solve(data: InstanceData,
                 elite_pool.append(sol)
                 if best is None or obj < best.obj:
                     best = sol
-                    best_obj_iter = t  # iteration where zero-violations + best objective both hold
+                    best_iter = t
 
             # Track the least-violated sample this iteration for APL penalty update
             vtuple = (v1, v2, v3)
@@ -675,7 +754,7 @@ def solve(data: InstanceData,
         key=lambda s: s.obj
     )
 
-    return best, penalty_log, elite_pool, num_qubits, best_obj_iter
+    return best, penalty_log, elite_pool, best_iter, num_qubits
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -721,8 +800,8 @@ def print_results(data_orig: InstanceData,
                   penalty_log: list,
                   solve_time: float,
                   used_ppln: bool,
-                  num_qubits: int,
-                  best_obj_iter: Optional[int]):
+                  best_iter: Optional[int] = None,
+                  num_qubits: Optional[int] = None):
 
     print("\n" + "="*65)
     print("  TLFLP QUBO SOLVER – RESULTS")
@@ -732,13 +811,15 @@ def print_results(data_orig: InstanceData,
           f"|C|={len(data_used.C)}, |R|={len(data_used.R)}")
     if used_ppln:
         print(f" PPLN     : |C| reduced from {len(data_orig.C)} → {len(data_used.C)}")
-    print(f" Qubits   : {num_qubits}  (total QUBO variables used by the sampler)")
+    if num_qubits is not None:
+        print(f" Qubits   : {num_qubits}  (Neal SA variables)")
     print(f" Feasible : {best is not None}")
 
     if best:
-        print(f"\n Objective (best feasible) : {best.obj:.2f}")
-        print(f" QUBO Energy               : {best.energy:.2f}")
-        print(f" Solution found at iter    : {best_obj_iter}")
+        print(f"\n Objective (best feasible): {best.obj:.2f}")
+        print(f" QUBO Energy             : {best.energy:.2f}")
+        if best_iter is not None:
+            print(f" Solution found at iter  : {best_iter}")
         if len(elite_pool) > 1:
             print(f"\n Top-{min(5,len(elite_pool))} feasible solutions found:")
             for rank, sol in enumerate(elite_pool[:5], 1):
@@ -770,15 +851,17 @@ def print_results(data_orig: InstanceData,
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Improved TLFLP QUBO solver with PPLN + Population SA + APL")
+        description="Improved TSLND QUBO solver with PPLN + Population SA + APL")
     ap.add_argument("instance",
                     help="Path to instance .txt file")
     ap.add_argument("--reads",      type=int,   default=8000,
                     help="SA reads per APL iteration (default 8000)")
-    ap.add_argument("--iters",      type=int,   default=40,
+    ap.add_argument("--iters",      type=int,   default=10,
                     help="APL outer iterations (default 40)")
     ap.add_argument("--sweeps",     type=int,   default=5000,
                     help="SA sweeps per read (default 5000)")
+    ap.add_argument("--pop_size",   type=int,   default=5,
+                    help="Population size for SA (default 5)")
     ap.add_argument("--seed",       type=int,   default=42,
                     help="Random seed (default 42)")
     ap.add_argument("--time_limit", type=float, default=300.0,
@@ -789,7 +872,7 @@ def main():
 
     print("="*65)
     print("  TLFLP Improved QUBO Solver")
-    print("  Ciacco et al. (2026) + PPLN + Greedy-Seeded APL SA")
+    print("  Ciacco et al. (2026) + PPLN + Population APL SA")
     print("="*65)
 
     # Parse
@@ -809,11 +892,12 @@ def main():
 
     # Solve
     t0 = time.time()
-    best, penalty_log, elite_pool, num_qubits, best_obj_iter = solve(
+    best, penalty_log, elite_pool, best_iter, num_qubits = solve(
         data_used,
         num_reads  = args.reads,
         num_iters  = args.iters,
         num_sweeps = args.sweeps,
+        pop_size   = args.pop_size,
         seed       = args.seed,
         time_limit = args.time_limit,
         verbose    = True,
@@ -823,7 +907,7 @@ def main():
     # Report
     print_results(data_orig, data_used, best, elite_pool,
                   penalty_log, solve_time, use_ppln,
-                  num_qubits, best_obj_iter)
+                  best_iter=best_iter, num_qubits=num_qubits)
 
 
 if __name__ == "__main__":
