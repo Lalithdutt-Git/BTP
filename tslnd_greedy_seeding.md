@@ -1,69 +1,149 @@
+Let me read every relevant section carefully before explaining.Now I have read everything. Here is the complete explanation.
 
-The Population SA Sampler with Greedy Seeding
----------------------------------------------
+---
 
-The PopulationSASampler is the fallback sampler used when neal/dimod are unavailable. It replaces the single random-start SA chain of a standard solver with a structured multi-chain architecture. The greedy seed is the cornerstone of this architecture.
+## What greedy seeding is and why it matters
 
-### What Problem the Seed Solves
+### The problem with random starts
 
-A standard SA sampler initialises each chain from a uniformly random binary vector. For a TLFLP instance, the vast majority of random binary assignments are deeply infeasible — they violate RDC coverage, capacity, and supply constraints simultaneously. An SA chain that starts in this region of the search space must spend most of its sweep budget climbing out of infeasibility before it can even begin exploring the feasible region. With a limited sweep budget, many chains never reach feasibility at all.
+SA works by starting from some binary vector and making small changes (one bit flip at a time), accepting changes that lower energy and occasionally accepting ones that raise it (to escape local minima). The critical question is: where does that starting vector come from?
 
-The greedy seed constructs a binary starting point that is structurally close to feasibility from the outset, so the SA chain starting from it begins its temperature descent already near the feasible region.
+In the base code, every single read started from a completely random binary vector — every variable independently set to 0 or 1 with equal probability. With 39 variables in your PPLN-reduced instance (or 384 in the full instance), a random vector has no logical structure. Consider what a random start looks like in terms of the actual problem:
 
-### How the Greedy Seed is Constructed
+- Some RDCs might be assigned to 3 CDCs simultaneously
+- Some RDCs might be assigned to none
+- CDC `z_j` might be 0 while plants are sending supply to it
+- Slack variables might be set to random values that contradict the supply/demand relationship
 
-The seed is built in three sequential steps, each operating on a different subset of the binary decision variables.
+This is a deeply infeasible state. SA must first climb out of all those violations before it can even begin optimising the objective. With `num_sweeps=5000` single-bit flips, most of the budget gets consumed just trying to find any feasible point. Often it never does within the sweep budget, which is why the base code rarely found feasible solutions for larger instances.
 
-**Step 1 — RDC-to-CDC assignment (y variables)**
+---
 
-All y, x, and z variables are initialised to 0. Then, for each RDC r in data.R, the algorithm finds the CDC j that minimises the transport cost b\_jr among all CDCs in data.T\_r\[r\] (the set of CDCs capable of serving r):
+### What the greedy seed does
 
-Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   best_j = min(data.T_r[r], key=lambda j: data.b_jr.get((j,r), 1e9))  sample[ymap[(best_j, r)]] = 1   `
+`build_greedy_seed` constructs one specific binary vector using logical reasoning about the problem, not random chance. It runs three steps in order:
 
-This is a greedy assignment by cheapest arc. Every RDC is assigned to exactly one CDC, which means constraint (13) — each RDC served exactly once — is satisfied by construction. The 1e9 default in the key function handles missing arcs gracefully by making them effectively infinite cost.
+**Step 1 — Assign every RDC to exactly one CDC**
 
-**Step 2 — CDC activation (z variables)**
+```python
+for r in data.R:
+    best_j = min(data.T_r[r], key=lambda j: data.b_jr.get((j, r), 1e9))
+    sample[ymap[(best_j, r)]] = 1
+```
 
-The set of CDCs that received at least one RDC assignment in Step 1 is collected:
+For each regional distribution center `r`, it looks at all CDCs that are allowed to serve it (`data.T_r[r]`) and picks the one with the lowest transport cost `b_jr`. It sets that `y_{j,r}` variable to 1 and leaves all others at 0.
 
-Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   active_cdcs = set()  for (j,r), nm in ymap.items():      if sample[nm] == 1:          active_cdcs.add(j)  for j in active_cdcs:      sample[zmap[j]] = 1   `
+After this step, **constraint (13) is fully satisfied** — every RDC is assigned to exactly one CDC. `v1 = 0` in the seed.
 
-Only CDCs that are actually used are activated. This is important because activating an unused CDC incurs its fixed opening cost c\_j in the objective with no benefit, and also introduces potential violations in constraint (15) since any supply routed through an inactive CDC would violate supply ≤ q\_j · z\_j. By activating exactly the used CDCs, the seed keeps z variables consistent with the y assignments.
+**Step 2 — Activate every CDC that received an assignment**
 
-**Step 3 — Plant-to-CDC assignment (x variables)**
+```python
+active_cdcs = set()
+for (j, r), nm in ymap.items():
+    if sample[nm] == 1:
+        active_cdcs.add(j)
+for j in active_cdcs:
+    sample[zmap[j]] = 1
+```
 
-For each active CDC j, the plant i in data.N\_c\[j\] with the lowest transportation cost a\_ij is assigned:
+It scans through all `y_{j,r}` variables just set, collects the CDCs that appear, and sets `z_j = 1` for each of them. CDCs with no RDC assignments remain at `z_j = 0`.
 
-Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   best_i = min(data.N_c[j], key=lambda i: data.a_ij.get((i,j), 1e9))  sample[xmap[(best_i, j)]] = 1   `
+This directly supports constraint (15): `sum(p_i * x_ij) <= q_j * z_j`. If a CDC is activated (`z_j=1`), the right-hand side is non-zero, which allows supply to flow through it legally.
 
-Only one plant is assigned per CDC. This is a greedy cheapest-arc decision on the supply side. It does not guarantee that capacity and demand constraints (14) and (15) are fully satisfied — a single plant may not supply enough to meet all demand routed to a CDC — but it produces a structurally coherent starting point where the active variables are at least logically consistent with each other.
+**Step 3 — Assign the cheapest plant to each active CDC**
 
-### Converting the Seed to a Binary Array
+```python
+for j in active_cdcs:
+    best_i = min(data.N_c[j], key=lambda i: data.a_ij.get((i, j), 1e9))
+    sample[xmap[(best_i, j)]] = 1
+```
 
-The seed is a dictionary mapping QUBO variable name strings (e.g. "y\_2\_5", "z\_3") to integer 0/1 values. Before it can be used as an SA starting state, it must be converted to a dense NumPy array indexed by the QUBO variable ordering:
+For each active CDC, it picks the plant with the lowest transport cost `a_ij` and sets `x_{i,j} = 1`.
 
-Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   def _seed_to_array(self, seed_dict, var_list, var_idx):      x = np.zeros(n, dtype=np.float64)      for nm, v in seed_dict.items():          if nm in var_idx:              x[var_idx[nm]] = float(v)      return x   `
+**Slack variables — all set to 0**
 
-Variables in the QUBO that do not appear in the seed dictionary (notably the binary slack variables s1 and s2 introduced for constraints 14 and 15) are left at 0. This is a reasonable default since zero slack means the constraint expression evaluates to whatever the decision variables produce — the SA will adjust slack bits early in its descent.
+```python
+sample = {var: 0 for var in all_qubo_vars}
+```
 
-### How the Seed Fits into the Population
+The seed initialises every variable in the entire QUBO to 0 first, then overrides the decision variables. This means all slack variables (`s1_j_0`, `s1_j_1`, ..., `s2_j_0`, `s2_j_1`, ...) start at 0. A slack value of 0 means "no slack needed" — the assumption is that the supply/demand balance is tight. SA will flip these bits during annealing to satisfy constraints (14) and (15) exactly.
 
-The population of pop\_size chains is assembled as follows:
+---
 
-Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   population = [x_gs]  # greedy seed chain  for _ in range(pop_size - 1):      population.append(rng.integers(0, 2, size=n))  # random chains   `
+### Why the seed must cover ALL variables, not just decision variables
 
-One chain starts from the greedy seed; all others start from independent uniform random binary vectors. The total read budget num\_reads is divided equally across all chains: reads\_per\_chain = num\_reads // pop\_size. This means the greedy seed chain receives the same number of SA runs as each random chain, but begins each of those runs from a structurally informed starting point.
+This is the bug that caused the `ValueError: mismatch between variables in 'initial_states' and 'bqm'`.
 
-### The Soft Restart Mechanism
+Neal's `initial_states` parameter requires the `SampleSet` to contain **exactly** the same variable set as the BQM — every variable that appears in any QUBO entry must have a value in the initial state. The original broken version only set the 21 decision variables and omitted the 18 slack variables. Neal counted 39 variables in the BQM and 21 in the initial state and refused to proceed.
 
-Within each chain, reads are not independent restarts from the same initial point. After each read completes, the next read starts from a **perturbed version of the solution just found**, not from the original chain initialisation:
+The fix was to first collect every variable that appears anywhere in Q:
 
-Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   flip_n = max(1, int(0.05 * n))  idxs = rng.choice(n, flip_n, replace=False)  chain_init = x.copy()  chain_init[idxs] = 1 - chain_init[idxs]   `
+```python
+all_qubo_vars = set()
+for (u, v) in Q:
+    all_qubo_vars.add(u)
+    all_qubo_vars.add(v)
+sample = {var: 0 for var in all_qubo_vars}   # all 39 variables initialised
+```
 
-Exactly 5% of the bits in the current solution are randomly flipped to produce the next starting point. This is a **basin-hopping** strategy: the SA has annealed to a local minimum, and the perturbation kicks it over a small energy barrier into a neighbouring basin, from which the next SA run descends again. For the greedy seed chain in particular, this means subsequent reads explore the neighbourhood of the greedy solution progressively — starting near feasibility, finding a local minimum, then probing adjacent basins — rather than jumping back to a fully random state.
+Then the greedy steps override only the decision variable subset. Slack variables remain at 0. Now the `SampleSet` contains all 39 variables and neal accepts it without complaint.
 
-### Why This Matters for Solution Quality
+This is also why `Q` is passed as a parameter to `build_greedy_seed` — the function needs to know the complete variable set of the QUBO, which it cannot determine from `xmap`, `ymap`, `zmap` alone since those only cover decision variables.
 
-The combination of these mechanisms addresses the three main failure modes of naive random-start SA on QUBO problems with hard constraints:
+---
 
-The greedy seed ensures that at least one chain in every APL iteration begins from a point where constraint (13) is already satisfied by construction, giving that chain's energy descent a head start toward the feasible region. The population of random chains provides diversity, exploring distant parts of the search space in parallel. The soft restart keeps each chain's reads locally correlated, allowing it to refine solutions incrementally rather than re-discovering the same basin from scratch on every read. Together, these properties increase the probability that at least one sample per iteration has zero violations — which is the condition required for a solution to be accepted and evaluated against the best known objective.
+### How it is wired into both samplers
+
+**For neal:**
+
+```python
+initial_ss = dimod.SampleSet.from_samples(
+    greedy_seed,          # dict with all 39 variables
+    vartype=dimod.BINARY,
+    energy=0.0
+)
+sampleset = sampler.sample_qubo(
+    Q,
+    num_reads      = num_reads,
+    num_sweeps     = num_sweeps,
+    initial_states = initial_ss,  # seeds one read
+)
+```
+
+Neal receives one sample in `initial_states`. It uses that as the starting point for one of its reads. The remaining `num_reads - 1` reads start randomly as usual. This means one read in every APL iteration begins from a logically structured, near-feasible point.
+
+**For NumpySASampler (fallback):**
+
+```python
+sample_list = sampler.sample_qubo(
+    Q,
+    num_reads     = num_reads,
+    num_sweeps    = num_sweeps,
+    initial_state = greedy_seed,   # used only for read index 0
+    seed          = seed + t,
+)
+```
+
+Inside `NumpySASampler.sample_qubo`:
+
+```python
+for read_idx in range(num_reads):
+    if read_idx == 0 and initial_state is not None:
+        x = np.array([float(initial_state.get(var_list[i], 0)) for i in range(n)])
+    else:
+        x = rng.integers(0, 2, size=n).astype(np.float64)
+```
+
+Only read index 0 uses the seed. All others are random. The behaviour is identical to the neal path.
+
+---
+
+### Why the seed is rebuilt every APL iteration
+
+```python
+for t in range(1, num_iters + 1):
+    Q, xmap, ymap, zmap = build_qubo_with_slacks(data, P1, P2, P3)
+    greedy_seed = build_greedy_seed(data, xmap, ymap, zmap, Q)
+```
+
+The QUBO is rebuilt at the start of each iteration because the penalty values P1, P2, P3 change between iterations. When penalties change, the diagonal and off-diagonal entries of Q change, but the **variable names** (`x_0_8`, `y_8_3`, `s1_8_0`, etc.) are regenerated fresh from `xmap`, `ymap`, `zmap`. The greedy seed must be rebuilt using these freshly generated name maps so the variable names in the seed exactly match the variable names in the new Q. If the seed were built once and reused, the variable names would still match (they are deterministic from the instance data), but rebuilding makes the dependency explicit and correct.
